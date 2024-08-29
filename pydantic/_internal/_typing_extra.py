@@ -9,7 +9,7 @@ import types
 import typing
 import warnings
 from collections.abc import Callable
-from functools import partial
+from functools import lru_cache, partial
 from types import GetSetDescriptorType
 from typing import TYPE_CHECKING, Any, Final, Iterable
 
@@ -203,7 +203,7 @@ def parent_frame_namespace(*, parent_depth: int = 2, force: bool = False) -> dic
 
     In other cases, like during initial schema build, if a class is defined at the top module level, we don't need to
     fetch that module's namespace, because the class' __module__ attribute can be used to access the parent namespace.
-    This is done in `_typing_extra.add_module_globals`. Thus, there's no need to cache the parent frame namespace in this case.
+    This is done in `_typing_extra.get_module_namespace`. Thus, there's no need to cache the parent frame namespace in this case.
     """
     frame = sys._getframe(parent_depth)
 
@@ -219,24 +219,23 @@ def parent_frame_namespace(*, parent_depth: int = 2, force: bool = False) -> dic
     return _remove_default_globals_from_ns(frame.f_locals)
 
 
-def add_module_globals(obj: Any, globalns: dict[str, Any] | None = None) -> dict[str, Any]:
-    module_name = getattr(obj, '__module__', None)
-    if module_name:
-        try:
-            module_globalns = sys.modules[module_name].__dict__
-        except KeyError:
-            # happens occasionally, see https://github.com/pydantic/pydantic/issues/2363
-            ns = {}
-        else:
-            ns = {**module_globalns, **globalns} if globalns else module_globalns.copy()
-    else:
-        ns = globalns or {}
-
-    return _remove_default_globals_from_ns(ns)
+@lru_cache(maxsize=None)
+def get_module_namespace(module_name: str) -> dict[str, Any]:
+    try:
+        return sys.modules[module_name].__dict__.copy()
+    except KeyError:
+        return {}
 
 
 def get_cls_types_namespace(cls: type[Any], parent_namespace: dict[str, Any] | None = None) -> dict[str, Any]:
-    ns = add_module_globals(cls, parent_namespace)
+    module_name = getattr(cls, '__module__', None)
+    if module_name:
+        module_globalns = get_module_namespace(module_name)
+        ns = {**module_globalns, **parent_namespace} if parent_namespace else module_globalns.copy()
+    else:
+        ns = parent_namespace or {}
+
+    ns = _remove_default_globals_from_ns(ns)
     ns[cls.__name__] = cls
     return ns
 
@@ -379,7 +378,7 @@ def get_function_type_hints(
             type_hints.setdefault('return', function)
         return type_hints
 
-    globalns = add_module_globals(function)
+    globalns = get_module_namespace(function.__module__)
     type_hints = {}
     type_params: tuple[Any] = getattr(function, '__type_params__', ())  # type: ignore
     for name, value in annotations.items():
